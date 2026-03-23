@@ -5,7 +5,7 @@ A production-ready, type-safe Go package for PostgreSQL with CQRS pattern, plugg
 ## Installation
 
 ```bash
-go get github.com/go-extreme/db-connector/v1
+go get github.com/go-extreme/db-connector/v2
 ```
 
 ## Features
@@ -32,7 +32,7 @@ package main
 import (
     "context"
     "time"
-    dbconnector "github.com/go-extreme/db-connector/v1"
+    dbconnector "github.com/go-extreme/db-connector/v2"
 )
 
 type User struct {
