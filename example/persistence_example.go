@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	dbconnector "github.com/go-extreme/db-connector"
+	dbconnector "github.com/go-extreme/db-connector/v1"
 	"github.com/jmoiron/sqlx"
 )
 
