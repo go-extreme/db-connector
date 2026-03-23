@@ -306,9 +306,7 @@ func (qb *QueryBuilder[T]) Build() Query[[]T] {
 	args := qb.args
 
 	executor := func(ctx context.Context) ([]T, error) {
-		var result []T
-		err := qb.model.readConn.DB().SelectContext(ctx, &result, sql, args...)
-		return result, err
+		return selectMany[T](ctx, qb.model.readConn.DB(), sql, args...)
 	}
 
 	q := newQuery(executor, sql, args...)

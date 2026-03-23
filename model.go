@@ -67,9 +67,7 @@ func (m *Model[T]) Find(id string, columns ...string) Query[T] {
 	base := fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", cols, m.tableName)
 	sql := m.applyBaseQuery(base)
 	executor := func(ctx context.Context) (T, error) {
-		var result T
-		err := m.readConn.DB().GetContext(ctx, &result, sql, id)
-		return result, err
+		return selectOne[T](ctx, m.readConn.DB(), sql, id)
 	}
 
 	q := newQuery(executor, sql, id)
@@ -85,9 +83,7 @@ func (m *Model[T]) FindBy(field string, value interface{}, columns ...string) Qu
 	base := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1", cols, m.tableName, field)
 	sql := m.applyBaseQuery(base)
 	executor := func(ctx context.Context) (T, error) {
-		var result T
-		err := m.readConn.DB().GetContext(ctx, &result, sql, value)
-		return result, err
+		return selectOne[T](ctx, m.readConn.DB(), sql, value)
 	}
 
 	q := newQuery(executor, sql, value)
@@ -103,9 +99,7 @@ func (m *Model[T]) GetBy(conditions map[string]interface{}, columns ...string) Q
 	base, args := m.buildWhereQuery(fmt.Sprintf("SELECT %s FROM %s", cols, m.tableName), conditions)
 	sql := m.applyBaseQuery(base)
 	executor := func(ctx context.Context) ([]T, error) {
-		var result []T
-		err := m.readConn.DB().SelectContext(ctx, &result, sql, args...)
-		return result, err
+		return selectMany[T](ctx, m.readConn.DB(), sql, args...)
 	}
 
 	q := newQuery(executor, sql, args...)
@@ -121,9 +115,7 @@ func (m *Model[T]) All(columns ...string) Query[[]T] {
 	base := fmt.Sprintf("SELECT %s FROM %s", cols, m.tableName)
 	sql := m.applyBaseQuery(base)
 	executor := func(ctx context.Context) ([]T, error) {
-		var result []T
-		err := m.readConn.DB().SelectContext(ctx, &result, sql)
-		return result, err
+		return selectMany[T](ctx, m.readConn.DB(), sql)
 	}
 
 	q := newQuery(executor, sql)
@@ -477,12 +469,14 @@ func (m *Model[T]) Pluck(ctx context.Context, column string, conditions map[stri
 // Chunk processes rows in batches of chunkSize, calling fn for each batch
 func (m *Model[T]) Chunk(ctx context.Context, chunkSize int, conditions map[string]interface{}, fn func([]T) error) error {
 	offset := 0
+	var err error
 	for {
 		base, args := m.buildWhereQuery(fmt.Sprintf("SELECT * FROM %s", m.tableName), conditions)
 		sql := m.applyBaseQuery(base)
 		sql += fmt.Sprintf(" LIMIT %d OFFSET %d", chunkSize, offset)
 		var batch []T
-		if err := m.readConn.DB().SelectContext(ctx, &batch, sql, args...); err != nil {
+		batch, err = selectMany[T](ctx, m.readConn.DB(), sql, args...)
+		if err != nil {
 			return err
 		}
 		if len(batch) == 0 {
@@ -500,13 +494,13 @@ func (m *Model[T]) Chunk(ctx context.Context, chunkSize int, conditions map[stri
 
 // Raw executes a raw SQL query and returns typed results
 func (m *Model[T]) Raw(ctx context.Context, sql string, args ...interface{}) ([]T, error) {
-	var result []T
-	err := m.readConn.DB().SelectContext(ctx, &result, sql, args...)
-	return result, err
+	return selectMany[T](ctx, m.readConn.DB(), sql, args...)
 }
 
 // PAGINATION
 
+// Page is a generic paginated result.
+// T is the row type (can differ from the Model's T when using PaginateAs).
 type Page[T any] struct {
 	Items      []T
 	Total      int
@@ -515,7 +509,27 @@ type Page[T any] struct {
 	TotalPages int
 }
 
-func (m *Model[T]) Paginate(ctx context.Context, page, pageSize int, conditions map[string]interface{}) (*Page[T], error) {
+// Paginate executes pagination using a QueryBuilder so all Where/OrderBy/Select
+// clauses are fully composable before calling this method.
+//
+// Example:
+//
+//	page, err := userModel.Paginate(ctx, 1, 20,
+//	    userModel.Query().Where("status", "active").OrderBy("created_at", true))
+func (m *Model[T]) Paginate(ctx context.Context, page, pageSize int, qb *QueryBuilder[T]) (*Page[T], error) {
+	return PaginateAs[T, T](ctx, m.readConn, page, pageSize, qb)
+}
+
+// PaginateAs is a free generic function that lets you paginate a QueryBuilder[T]
+// but scan results into a completely different struct R.
+// This is useful for projections / DTOs.
+//
+// Example:
+//
+//	type UserDTO struct { ID string `db:"id"`; Name string `db:"name"` }
+//	page, err := dbconnector.PaginateAs[User, UserDTO](ctx, conn, 1, 20,
+//	    model.Query().Select("id", "name").Where("active", true))
+func PaginateAs[T any, R any](ctx context.Context, conn Connection, page, pageSize int, qb *QueryBuilder[T]) (*Page[R], error) {
 	if page < 1 {
 		page = 1
 	}
@@ -523,27 +537,35 @@ func (m *Model[T]) Paginate(ctx context.Context, page, pageSize int, conditions 
 		pageSize = 10
 	}
 
-	// Get total count
-	total, err := m.Count(ctx, conditions)
-	if err != nil {
+	// Build the base SQL (filters, ordering, etc.) without LIMIT/OFFSET
+	baseSql := qb.query.String()
+	if !qb.withTrashed {
+		baseSql = qb.model.applyBaseQuery(baseSql)
+	}
+	args := qb.args
+
+	// Count query: wrap in a subquery to respect all WHERE conditions
+	countSql := fmt.Sprintf("SELECT COUNT(*) FROM (%s) AS _paginate_count", baseSql)
+	var total int
+	if err := conn.DB().GetContext(ctx, &total, countSql, args...); err != nil {
 		return nil, err
 	}
 
-	// Get items
+	// Data query: append LIMIT / OFFSET as literals (safe – they are ints)
 	offset := (page - 1) * pageSize
-	base, args := m.buildWhereQuery(fmt.Sprintf("SELECT * FROM %s", m.tableName), conditions)
-	sql := m.applyBaseQuery(base)
-	sql += fmt.Sprintf(" LIMIT %d OFFSET %d", pageSize, offset)
+	dataSql := fmt.Sprintf("%s LIMIT %d OFFSET %d", baseSql, pageSize, offset)
 
-	var items []T
-	err = m.readConn.DB().SelectContext(ctx, &items, sql, args...)
-	if err != nil {
-		return nil, err
+	items, itemsErr := selectMany[R](ctx, conn.DB(), dataSql, args...)
+	if itemsErr != nil {
+		return nil, itemsErr
 	}
 
-	totalPages := (total + pageSize - 1) / pageSize
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
 
-	return &Page[T]{
+	return &Page[R]{
 		Items:      items,
 		Total:      total,
 		Page:       page,

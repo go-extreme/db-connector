@@ -906,7 +906,7 @@ func TestModel_Paginate(t *testing.T) {
 		})
 	}
 
-	page, err := m.Paginate(ctx, 1, 3, nil)
+	page, err := m.Paginate(ctx, 1, 3, m.Query())
 	if err != nil {
 		t.Fatalf("Paginate: %v", err)
 	}
@@ -933,7 +933,7 @@ func TestModel_Paginate_DefaultValues(t *testing.T) {
 	ctx := context.Background()
 
 	// page=0 and pageSize=0 should use defaults (page=1, pageSize=10)
-	page, err := m.Paginate(ctx, 0, 0, nil)
+	page, err := m.Paginate(ctx, 0, 0, m.Query())
 	if err != nil {
 		t.Fatalf("Paginate defaults: %v", err)
 	}
@@ -954,7 +954,7 @@ func TestModel_Paginate_WithConditions(t *testing.T) {
 	_ = m.Create(ctx, User{ID: "pgc2", Name: "Active2", Email: "a2@a.com", Age: 30})
 	_ = m.Create(ctx, User{ID: "pgc3", Name: "Other", Email: "o@o.com", Age: 25})
 
-	page, err := m.Paginate(ctx, 1, 10, map[string]interface{}{"age": 30})
+	page, err := m.Paginate(ctx, 1, 10, m.Query().Where("age", 30))
 	if err != nil {
 		t.Fatalf("Paginate with conditions: %v", err)
 	}
@@ -977,7 +977,7 @@ func TestModel_Paginate_LastPage(t *testing.T) {
 		})
 	}
 
-	page, err := m.Paginate(ctx, 3, 3, nil)
+	page, err := m.Paginate(ctx, 3, 3, m.Query())
 	if err != nil {
 		t.Fatalf("Paginate last page: %v", err)
 	}
@@ -1734,7 +1734,7 @@ func TestModel_Paginate_CountError(t *testing.T) {
 	defer conn.Close()
 
 	m := NewModel[User](NewConnector(conn, conn), "nonexistent_paginate_xyz")
-	_, err := m.Paginate(context.Background(), 1, 10, nil)
+	_, err := m.Paginate(context.Background(), 1, 10, m.Query())
 	if err == nil {
 		t.Error("expected error from Paginate on missing table")
 	}
@@ -1892,7 +1892,7 @@ func TestModel_Paginate_ItemsError(t *testing.T) {
 
 	// Both count and items will fail – covers the count-error-return path too
 	m := NewModel[User](NewConnector(conn, conn), "nonexistent_paginate_items_xyz")
-	_, err := m.Paginate(context.Background(), 1, 10, nil)
+	_, err := m.Paginate(context.Background(), 1, 10, m.Query())
 	if err == nil {
 		t.Error("expected error from Paginate count on missing table")
 	}
@@ -2253,7 +2253,7 @@ func TestModel_Paginate_EmptyTable(t *testing.T) {
 	m, cleanup := setupTable(t)
 	defer cleanup()
 	ctx := context.Background()
-	page, err := m.Paginate(ctx, 1, 10, nil)
+	page, err := m.Paginate(ctx, 1, 10, m.Query())
 	if err != nil {
 		t.Fatalf("Paginate: %v", err)
 	}

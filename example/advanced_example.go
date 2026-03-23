@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	dbconnector "github.com/go-extreme/db-connector/v2"
+	dbconnector "github.com/go-extreme/db-connector/v3"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -138,7 +138,7 @@ func main() {
 	}
 
 	// Pagination
-	page, err := users.Paginate(ctx, 1, 20, map[string]interface{}{"status": "active"})
+	page, err := users.Paginate(ctx, 1, 20, users.Query().Where("status", "active"))
 	if err != nil {
 		log.Printf("Pagination error: %v", err)
 	} else {
