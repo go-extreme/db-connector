@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	dbconnector "github.com/go-extreme/db-connector/v3"
+	dbconnector "github.com/go-extreme/db-connector/v4"
 	"github.com/jmoiron/sqlx"
 )
 
