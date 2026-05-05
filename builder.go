@@ -7,16 +7,37 @@ import (
 )
 
 type QueryBuilder[T any] struct {
-	model      *Model[T]
-	query      strings.Builder
-	args       []interface{}
-	whereAdded bool
+	model       *Model[T]
+	query       strings.Builder
+	args        []interface{}
+	whereAdded  bool
+	withTrashed bool
 }
 
 func NewQueryBuilder[T any](model *Model[T]) *QueryBuilder[T] {
 	qb := &QueryBuilder[T]{model: model}
 	qb.query.WriteString("SELECT * FROM ")
 	qb.query.WriteString(model.tableName)
+	return qb
+}
+
+// WithTrashed includes soft-deleted rows in the query
+func (qb *QueryBuilder[T]) WithTrashed() *QueryBuilder[T] {
+	qb.withTrashed = true
+	return qb
+}
+
+// Select overrides the selected columns (must be called before any Where/Order/etc.)
+func (qb *QueryBuilder[T]) Select(columns ...string) *QueryBuilder[T] {
+	qb.query.Reset()
+	qb.query.WriteString("SELECT ")
+	if len(columns) == 0 {
+		qb.query.WriteString("*")
+	} else {
+		qb.query.WriteString(strings.Join(columns, ", "))
+	}
+	qb.query.WriteString(" FROM ")
+	qb.query.WriteString(qb.model.tableName)
 	return qb
 }
 
@@ -279,12 +300,13 @@ func (qb *QueryBuilder[T]) Args() []interface{} {
 // Build finalizes the query and returns an executable Query
 func (qb *QueryBuilder[T]) Build() Query[[]T] {
 	sql := qb.query.String()
+	if !qb.withTrashed {
+		sql = qb.model.applyBaseQuery(sql)
+	}
 	args := qb.args
 
 	executor := func(ctx context.Context) ([]T, error) {
-		var result []T
-		err := qb.model.readConn.DB().SelectContext(ctx, &result, sql, args...)
-		return result, err
+		return selectMany[T](ctx, qb.model.readConn.DB(), sql, args...)
 	}
 
 	q := newQuery(executor, sql, args...)

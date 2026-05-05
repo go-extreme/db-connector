@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	dbconnector "github.com/go-extreme/db-connector"
+	dbconnector "github.com/go-extreme/db-connector/v4"
 )
 
 func main() {

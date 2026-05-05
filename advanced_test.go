@@ -85,8 +85,8 @@ func TestBatchOperations(t *testing.T) {
 
 	// Test batch create
 	users := []User{
-		{ID: 1, Name: "User1", Age: 25},
-		{ID: 2, Name: "User2", Age: 30},
+		{ID: "1", Name: "User1", Age: 25},
+		{ID: "2", Name: "User2", Age: 30},
 	}
 
 	err := model.BatchCreate(context.Background(), users, 10)
