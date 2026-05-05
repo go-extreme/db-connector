@@ -1,4 +1,4 @@
-module github.com/go-extreme/db-connector/v3
+module github.com/go-extreme/db-connector/v4
 
 go 1.21
 

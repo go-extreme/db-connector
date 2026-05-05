@@ -3,6 +3,7 @@ package dbconnector
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -19,7 +20,7 @@ func WithLogging(logger func(query string, duration time.Duration)) QueryMiddlew
 	}
 }
 
-// WithRetry retries failed queries
+// WithRetry retries failed queries up to maxRetries times with exponential back-off.
 func WithRetry(maxRetries int) QueryMiddleware {
 	return func(ctx context.Context, query string, execute func(context.Context) error) error {
 		var err error
@@ -36,25 +37,75 @@ func WithRetry(maxRetries int) QueryMiddleware {
 	}
 }
 
-// WithCircuitBreaker implements circuit breaker pattern
+// WithTransientRetry retries only transient database errors (deadlock,
+// serialization failure) up to maxRetries times with exponential back-off.
+func WithTransientRetry(maxRetries int) QueryMiddleware {
+	return func(ctx context.Context, query string, execute func(context.Context) error) error {
+		var err error
+		for i := 0; i <= maxRetries; i++ {
+			err = execute(ctx)
+			if err == nil {
+				return nil
+			}
+			if !IsTransient(err) {
+				return err
+			}
+			if i < maxRetries {
+				time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+			}
+		}
+		return err
+	}
+}
+
+// circuitBreakerState holds the mutable state of a circuit breaker, protected
+// by a mutex so it is safe for concurrent use across goroutines.
+type circuitBreakerState struct {
+	mu           sync.Mutex
+	failures     int
+	lastFailTime time.Time
+}
+
+// WithCircuitBreaker implements the circuit-breaker pattern.
+// After threshold consecutive failures the breaker opens and every subsequent
+// call returns ErrCircuitOpen until the timeout elapses and the breaker
+// half-opens again.
 func WithCircuitBreaker(threshold int, timeout time.Duration) QueryMiddleware {
-	failures := 0
-	lastFailTime := time.Time{}
+	state := &circuitBreakerState{}
 
 	return func(ctx context.Context, query string, execute func(context.Context) error) error {
-		if failures >= threshold && time.Since(lastFailTime) < timeout {
+		state.mu.Lock()
+		open := state.failures >= threshold && time.Since(state.lastFailTime) < timeout
+		state.mu.Unlock()
+
+		if open {
 			return ErrCircuitOpen
 		}
 
 		err := execute(ctx)
-		if err != nil {
-			failures++
-			lastFailTime = time.Now()
-			return err
-		}
 
-		failures = 0
-		return nil
+		state.mu.Lock()
+		if err != nil {
+			state.failures++
+			state.lastFailTime = time.Now()
+		} else {
+			state.failures = 0
+		}
+		state.mu.Unlock()
+
+		return err
+	}
+}
+
+// WithSlowQueryLog logs any query whose execution time exceeds threshold.
+func WithSlowQueryLog(threshold time.Duration, logger func(query string, duration time.Duration)) QueryMiddleware {
+	return func(ctx context.Context, query string, execute func(context.Context) error) error {
+		start := time.Now()
+		err := execute(ctx)
+		if d := time.Since(start); d >= threshold {
+			logger(query, d)
+		}
+		return err
 	}
 }
 

@@ -17,10 +17,10 @@ import (
 // privateAccount mirrors the user's Account struct – every domain field is
 // unexported but carries a `db` tag so the unsafe scanner must populate them.
 type privateAccount struct {
-	id        string  `db:"id"`
-	name      string  `db:"name"`
-	email     string  `db:"email"`
-	age       int     `db:"age"`
+	id    string `db:"id"`
+	name  string `db:"name"`
+	email string `db:"email"`
+	age   int    `db:"age"`
 }
 
 // Exported getters so tests can read values without reflection.
@@ -322,7 +322,10 @@ func TestRowScannerStrategy_FindAndAll(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	for i, row := range []struct{ id, name, email string; age int }{
+	for i, row := range []struct {
+		id, name, email string
+		age             int
+	}{
 		{"rs1", "Diana", "diana@x.com", 28},
 		{"rs2", "Eve", "eve@x.com", 32},
 	} {
@@ -464,3 +467,97 @@ func TestUnsafeScanner_TimeField(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// unsafeSetField – pointer-field path
+// Tests that a *string unexported field is populated correctly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ptrFieldRow struct {
+	id   string  `db:"id"`
+	note *string `db:"note"`
+}
+
+func TestUnsafeSetField_PtrField_NonNil(t *testing.T) {
+	conn := NewPostgresConnection(__TestDBconfig)
+	if err := conn.Connect(context.Background()); err != nil {
+		t.Skipf("no DB: %v", err)
+	}
+	defer conn.Close()
+
+	db := conn.DB()
+	table := "test_ptrf_scanner"
+	db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE %s (id TEXT PRIMARY KEY, note TEXT)`, table)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+
+	if _, err := db.Exec(fmt.Sprintf("INSERT INTO %s VALUES ($1, $2)", table), "pf1", "hello"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	m := NewModel[ptrFieldRow](NewConnector(conn, conn), table)
+	got, err := m.Find("pf1").Exec(context.Background())
+	if err != nil {
+		t.Fatalf("Find ptr field: %v", err)
+	}
+	if got.note == nil {
+		t.Fatal("note should not be nil")
+	}
+	if *got.note != "hello" {
+		t.Errorf("note: want 'hello', got %q", *got.note)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// unsafeScanRow – pointer receiver T = *privateAccount
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestUnsafeScanner_PtrResult(t *testing.T) {
+	// privateAccount has unexported fields – scan as *privateAccount
+	conn := NewPostgresConnection(__TestDBconfig)
+	if err := conn.Connect(context.Background()); err != nil {
+		t.Skipf("no DB: %v", err)
+	}
+	defer conn.Close()
+
+	db := conn.DB()
+	table := "test_ptr_result_scanner"
+	db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE %s (id TEXT PRIMARY KEY, name TEXT, email TEXT, age INT)`, table)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+
+	if _, err := db.Exec(fmt.Sprintf("INSERT INTO %s VALUES ($1,$2,$3,$4)", table), "ptr1", "PtrUser", "p@p.com", 42); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Use *privateAccount so the isPtr branch in unsafeScanRow is exercised.
+	m := NewModel[*privateAccount](NewConnector(conn, conn), table)
+	got, err := m.Find("ptr1").Exec(context.Background())
+	if err != nil {
+		t.Fatalf("Find *T: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil *privateAccount")
+	}
+	if got.ID() != "ptr1" {
+		t.Errorf("ID: want ptr1, got %q", got.ID())
+	}
+	if got.Name() != "PtrUser" {
+		t.Errorf("Name: want PtrUser, got %q", got.Name())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// formatArg – nil *time.Time branch
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestFormatArg_NilPtrTimestamp(t *testing.T) {
+	var nilTs *time.Time
+	result := InterpolateSQL("col=$1", nilTs)
+	if result != "col=NULL" {
+		t.Errorf("nil *time.Time should render as NULL, got %q", result)
+	}
+}

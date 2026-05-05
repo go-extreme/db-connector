@@ -13,12 +13,13 @@ import (
 // Model provides unified CQRS-compliant interface
 // Automatically routes reads to readConn and writes to writeConn
 type Model[T any] struct {
-	readConn        Connection
-	writeConn       Connection
-	tableName       string
-	cache           Cache
-	cacheTTL        time.Duration
-	softDeleteCol   string
+	readConn      Connection
+	writeConn     Connection
+	tableName     string
+	cache         Cache
+	cacheTTL      time.Duration
+	softDeleteCol string
+	middlewares   []QueryMiddleware
 }
 
 func NewModel[T any](connector Connector, tableName string) *Model[T] {
@@ -42,6 +43,32 @@ func (m *Model[T]) WithSoftDelete(column string) *Model[T] {
 	return m
 }
 
+// WithMiddleware attaches one or more QueryMiddleware functions that wrap every
+// query executed through this model.  Middlewares are applied in the order
+// provided (first = outermost wrapper).
+func (m *Model[T]) WithMiddleware(mw ...QueryMiddleware) *Model[T] {
+	m.middlewares = append(m.middlewares, mw...)
+	return m
+}
+
+// attachCache sets the cache, TTL, table-prefix, and middleware chain on a
+// freshly created query.
+func (m *Model[T]) attachCache(q *query[T]) {
+	attachQueryMeta(q, m.tableName, m.middlewares, m.cache, m.cacheTTL)
+}
+
+// attachQueryMeta is the generic helper that sets metadata on any query[R].
+// Using a package-level generic function lets it serve both *query[T] and
+// *query[[]T] without duplicating code.
+func attachQueryMeta[R any](q *query[R], tableName string, middlewares []QueryMiddleware, cache Cache, cacheTTL time.Duration) {
+	q.tablePrefix = tableName
+	q.middlewares = middlewares
+	if cache != nil {
+		q.cache = cache
+		q.cacheTTL = cacheTTL
+	}
+}
+
 func (m *Model[T]) softDeleteFilter() string {
 	if m.softDeleteCol == "" {
 		return ""
@@ -49,15 +76,48 @@ func (m *Model[T]) softDeleteFilter() string {
 	return fmt.Sprintf("%s IS NULL", m.softDeleteCol)
 }
 
+// applyBaseQuery injects the soft-delete IS NULL filter into a SQL string at
+// the correct position: after all WHERE conditions but BEFORE any ORDER BY /
+// GROUP BY / HAVING / LIMIT / OFFSET clauses.
 func (m *Model[T]) applyBaseQuery(base string) string {
-	filter := m.softDeleteFilter()
+	return injectSoftDeleteFilter(base, m.softDeleteFilter())
+}
+
+// injectSoftDeleteFilter is the pure (model-free) helper that does the actual
+// injection so it can be reused by QueryBuilder as well.
+func injectSoftDeleteFilter(sql, filter string) string {
 	if filter == "" {
-		return base
+		return sql
 	}
-	if strings.Contains(base, "WHERE") {
-		return base + " AND " + filter
+
+	upper := strings.ToUpper(sql)
+
+	// Find the earliest clause that must come AFTER the WHERE block.
+	breakKeywords := []string{" ORDER BY ", " GROUP BY ", " HAVING ", " LIMIT ", " OFFSET "}
+	insertPos := -1
+	for _, kw := range breakKeywords {
+		if idx := strings.Index(upper, kw); idx != -1 {
+			if insertPos == -1 || idx < insertPos {
+				insertPos = idx
+			}
+		}
 	}
-	return base + " WHERE " + filter
+
+	if insertPos != -1 {
+		// There is an ORDER BY / LIMIT / … clause – inject before it.
+		before := sql[:insertPos]
+		after := sql[insertPos:]
+		if strings.Contains(strings.ToUpper(before), "WHERE") {
+			return before + " AND " + filter + after
+		}
+		return before + " WHERE " + filter + after
+	}
+
+	// No break keyword – append normally.
+	if strings.Contains(upper, "WHERE") {
+		return sql + " AND " + filter
+	}
+	return sql + " WHERE " + filter
 }
 
 // READ OPERATIONS (use readConn)
@@ -71,10 +131,7 @@ func (m *Model[T]) Find(id string, columns ...string) Query[T] {
 	}
 
 	q := newQuery(executor, sql, id)
-	if m.cache != nil {
-		q.cache = m.cache
-		q.cacheTTL = m.cacheTTL
-	}
+	m.attachCache(q)
 	return q
 }
 
@@ -87,10 +144,7 @@ func (m *Model[T]) FindBy(field string, value interface{}, columns ...string) Qu
 	}
 
 	q := newQuery(executor, sql, value)
-	if m.cache != nil {
-		q.cache = m.cache
-		q.cacheTTL = m.cacheTTL
-	}
+	m.attachCache(q)
 	return q
 }
 
@@ -103,10 +157,7 @@ func (m *Model[T]) GetBy(conditions map[string]interface{}, columns ...string) Q
 	}
 
 	q := newQuery(executor, sql, args...)
-	if m.cache != nil {
-		q.cache = m.cache
-		q.cacheTTL = m.cacheTTL
-	}
+	attachQueryMeta(q, m.tableName, m.middlewares, m.cache, m.cacheTTL)
 	return q
 }
 
@@ -119,10 +170,7 @@ func (m *Model[T]) All(columns ...string) Query[[]T] {
 	}
 
 	q := newQuery(executor, sql)
-	if m.cache != nil {
-		q.cache = m.cache
-		q.cacheTTL = m.cacheTTL
-	}
+	attachQueryMeta(q, m.tableName, m.middlewares, m.cache, m.cacheTTL)
 	return q
 }
 
@@ -155,6 +203,19 @@ func (m *Model[T]) ExistsBy(ctx context.Context, conditions map[string]interface
 
 func (m *Model[T]) Query() *QueryBuilder[T] {
 	return NewQueryBuilder(m)
+}
+
+// QueryFromSQL creates a QueryBuilder pre-loaded with the given raw SQL and
+// bound arguments.  Subsequent Where/OrderBy/Limit calls continue from where
+// the raw SQL left off.
+//
+// Example:
+//
+//	qb := userModel.QueryFromSQL(
+//	    "SELECT * FROM users WHERE tenant_id = $1", "tenant-abc")
+//	qb.Where("status", "active").OrderBy("created_at", true)
+func (m *Model[T]) QueryFromSQL(rawSQL string, args ...interface{}) *QueryBuilder[T] {
+	return NewQueryBuilderFromSQL(m, rawSQL, args...)
 }
 
 // WRITE OPERATIONS (use writeConn)
@@ -509,27 +570,118 @@ type Page[T any] struct {
 	TotalPages int
 }
 
-// Paginate executes pagination using a QueryBuilder so all Where/OrderBy/Select
-// clauses are fully composable before calling this method.
+// HasNext reports whether there is a page after the current one.
+func (p *Page[T]) HasNext() bool {
+	return p.Page < p.TotalPages
+}
+
+// HasPrev reports whether there is a page before the current one.
+func (p *Page[T]) HasPrev() bool {
+	return p.Page > 1
+}
+
+// NextPage returns the next page number, or the current page if already on the last.
+func (p *Page[T]) NextPage() int {
+	if p.HasNext() {
+		return p.Page + 1
+	}
+	return p.Page
+}
+
+// PrevPage returns the previous page number, or the current page if already on the first.
+func (p *Page[T]) PrevPage() int {
+	if p.HasPrev() {
+		return p.Page - 1
+	}
+	return p.Page
+}
+
+// Paginatable[T] is satisfied by both *QueryBuilder[T] and *RawQuery[T].
+// Any type that can provide a base SQL string, bound args, a soft-delete
+// filter, and a table name can drive Paginate / PaginateAs.
+type Paginatable[T any] interface {
+	// paginatableSQL returns the fully-built SQL (without LIMIT/OFFSET).
+	paginatableSQL() string
+	// paginatableArgs returns the bound arguments for the SQL.
+	paginatableArgs() []interface{}
+	// paginatableTableName returns the table name (used for count alias).
+	paginatableTableName() string
+}
+
+// ── *QueryBuilder[T] satisfies Paginatable[T] ─────────────────────────────
+
+func (qb *QueryBuilder[T]) paginatableSQL() string {
+	sql := qb.query.String()
+	if !qb.withTrashed {
+		sql = injectSoftDeleteFilter(sql, qb.model.softDeleteFilter())
+	}
+	return sql
+}
+
+func (qb *QueryBuilder[T]) paginatableArgs() []interface{} { return qb.args }
+
+func (qb *QueryBuilder[T]) paginatableTableName() string { return qb.model.tableName }
+
+// ── RawQuery[T] – raw SQL paginatable ──────────────────────────────────────
+
+// RawQuery[T] wraps a hand-written SQL string so it can be passed to
+// Paginate / PaginateAs.  Create one with NewRawQuery.
 //
-// Example:
+//	page, err := model.Paginate(ctx, 1, 20,
+//	    dbconnector.NewRawQuery[User]("users",
+//	        "SELECT * FROM users WHERE status = $1 ORDER BY created_at DESC",
+//	        "active"))
+type RawQuery[T any] struct {
+	tableName string
+	sql       string
+	args      []interface{}
+}
+
+// NewRawQuery creates a Paginatable from a raw SQL string.
+// tableName is only used for the COUNT subquery alias; it does not have to
+// match any real table if the SQL already has its own FROM clause.
+func NewRawQuery[T any](tableName, sql string, args ...interface{}) *RawQuery[T] {
+	return &RawQuery[T]{tableName: tableName, sql: sql, args: args}
+}
+
+func (r *RawQuery[T]) paginatableSQL() string         { return r.sql }
+func (r *RawQuery[T]) paginatableArgs() []interface{} { return r.args }
+func (r *RawQuery[T]) paginatableTableName() string   { return r.tableName }
+
+// ── Paginate & PaginateAs ──────────────────────────────────────────────────
+
+// Paginate runs pagination over any Paginatable[T] source (a *QueryBuilder[T]
+// or a *RawQuery[T]) and returns a typed Page[T].
+//
+// Example with QueryBuilder:
 //
 //	page, err := userModel.Paginate(ctx, 1, 20,
 //	    userModel.Query().Where("status", "active").OrderBy("created_at", true))
-func (m *Model[T]) Paginate(ctx context.Context, page, pageSize int, qb *QueryBuilder[T]) (*Page[T], error) {
-	return PaginateAs[T, T](ctx, m.readConn, page, pageSize, qb)
+//
+// Example with raw SQL:
+//
+//	page, err := userModel.Paginate(ctx, 1, 20,
+//	    dbconnector.NewRawQuery[User]("users",
+//	        "SELECT * FROM users WHERE active = $1", true))
+func (m *Model[T]) Paginate(ctx context.Context, page, pageSize int, src Paginatable[T]) (*Page[T], error) {
+	return paginateCore[T, T](ctx, m.readConn, page, pageSize, src)
 }
 
-// PaginateAs is a free generic function that lets you paginate a QueryBuilder[T]
-// but scan results into a completely different struct R.
-// This is useful for projections / DTOs.
+// PaginateAs is a free generic function that paginates any Paginatable[T]
+// source but scans results into a different struct R.
+// Useful for projections / DTOs.
 //
 // Example:
 //
 //	type UserDTO struct { ID string `db:"id"`; Name string `db:"name"` }
 //	page, err := dbconnector.PaginateAs[User, UserDTO](ctx, conn, 1, 20,
 //	    model.Query().Select("id", "name").Where("active", true))
-func PaginateAs[T any, R any](ctx context.Context, conn Connection, page, pageSize int, qb *QueryBuilder[T]) (*Page[R], error) {
+func PaginateAs[T any, R any](ctx context.Context, conn Connection, page, pageSize int, src Paginatable[T]) (*Page[R], error) {
+	return paginateCore[T, R](ctx, conn, page, pageSize, src)
+}
+
+// paginateCore is the shared implementation used by both Paginate and PaginateAs.
+func paginateCore[T any, R any](ctx context.Context, conn Connection, page, pageSize int, src Paginatable[T]) (*Page[R], error) {
 	if page < 1 {
 		page = 1
 	}
@@ -537,23 +689,22 @@ func PaginateAs[T any, R any](ctx context.Context, conn Connection, page, pageSi
 		pageSize = 10
 	}
 
-	// Build the base SQL (filters, ordering, etc.) without LIMIT/OFFSET
-	baseSql := qb.query.String()
-	if !qb.withTrashed {
-		baseSql = qb.model.applyBaseQuery(baseSql)
-	}
-	args := qb.args
+	args := src.paginatableArgs()
 
-	// Count query: wrap in a subquery to respect all WHERE conditions
-	countSql := fmt.Sprintf("SELECT COUNT(*) FROM (%s) AS _paginate_count", baseSql)
+	// Full SQL already has the soft-delete filter injected at the right position.
+	fullSql := src.paginatableSQL()
+
+	// Count query: rewrite SELECT … → SELECT COUNT(*) FROM …, strip ORDER BY/LIMIT/OFFSET.
+	countSql := buildCountSQL(fullSql, src.paginatableTableName())
 	var total int
 	if err := conn.DB().GetContext(ctx, &total, countSql, args...); err != nil {
 		return nil, err
 	}
 
-	// Data query: append LIMIT / OFFSET as literals (safe – they are ints)
+	// Data query: strip any pre-existing LIMIT/OFFSET, then append ours.
+	dataSqlBase := stripLimitOffset(fullSql)
 	offset := (page - 1) * pageSize
-	dataSql := fmt.Sprintf("%s LIMIT %d OFFSET %d", baseSql, pageSize, offset)
+	dataSql := fmt.Sprintf("%s LIMIT %d OFFSET %d", dataSqlBase, pageSize, offset)
 
 	items, itemsErr := selectMany[R](ctx, conn.DB(), dataSql, args...)
 	if itemsErr != nil {
@@ -572,6 +723,54 @@ func PaginateAs[T any, R any](ctx context.Context, conn Connection, page, pageSi
 		PageSize:   pageSize,
 		TotalPages: totalPages,
 	}, nil
+}
+
+// buildCountSQL converts a SELECT … FROM … query into SELECT COUNT(*) FROM …
+// by extracting only the FROM … WHERE … part and stripping ORDER BY / LIMIT / OFFSET.
+// tableName is used as the alias for the inner subquery when no FROM clause can
+// be found in the SQL (exotic shapes such as VALUES lists).
+func buildCountSQL(sql, tableName string) string {
+	upper := strings.ToUpper(sql)
+
+	// Find the FROM position in the original SQL.
+	fromIdx := strings.Index(upper, " FROM ")
+	if fromIdx == -1 {
+		// Fallback: wrap in a named subquery using the table name as alias.
+		return fmt.Sprintf("SELECT COUNT(*) FROM (%s) AS %s_cnt", stripOrderByLimitOffset(sql), tableName)
+	}
+
+	// Take everything from FROM onwards, then strip ORDER BY/LIMIT/OFFSET.
+	fromPart := sql[fromIdx:] // " FROM table WHERE ..."
+	fromPart = stripOrderByLimitOffset(fromPart)
+	return "SELECT COUNT(*)" + fromPart
+}
+
+// stripLimitOffset removes trailing LIMIT … and OFFSET … clauses from a SQL string.
+// It leaves ORDER BY in place (needed for pagination result ordering).
+func stripLimitOffset(sql string) string {
+	upper := strings.ToUpper(sql)
+	// Work from the back: remove OFFSET first, then LIMIT.
+	if idx := strings.LastIndex(upper, " OFFSET "); idx != -1 {
+		sql = sql[:idx]
+		upper = upper[:idx]
+	}
+	if idx := strings.LastIndex(upper, " LIMIT "); idx != -1 {
+		sql = sql[:idx]
+	}
+	return sql
+}
+
+// stripOrderByLimitOffset removes ORDER BY, LIMIT, and OFFSET clauses for count queries.
+func stripOrderByLimitOffset(sql string) string {
+	upper := strings.ToUpper(sql)
+	// Strip in reverse order of typical appearance.
+	for _, kw := range []string{" OFFSET ", " LIMIT ", " ORDER BY "} {
+		if idx := strings.LastIndex(upper, kw); idx != -1 {
+			sql = sql[:idx]
+			upper = upper[:idx]
+		}
+	}
+	return sql
 }
 
 // Helper methods
@@ -600,9 +799,9 @@ func (m *Model[T]) buildWhereClause(conditions map[string]interface{}, startIdx 
 }
 
 func (m *Model[T]) invalidateCache(ctx context.Context) {
-	// Simple cache invalidation - delete all keys for this table
-	// In production, use more sophisticated cache invalidation
-	_ = m.cache.Delete(ctx, m.tableName+"*")
+	// Delete all cache keys for this table using the "prefix*" pattern supported
+	// by both InMemoryCache and RedisCache implementations.
+	_ = m.cache.Delete(ctx, m.tableName+":*")
 }
 
 // DB returns the underlying read database connection

@@ -203,9 +203,9 @@ func selectOne[T any](ctx context.Context, db *sqlx.DB, rawSQL string, args ...i
 		return unsafeScanRow[T](rows)
 	}
 
-	// Standard sqlx path
+	// Standard sqlx path – use Unsafe so columns not present in T are ignored.
 	var result T
-	err := db.GetContext(ctx, &result, rawSQL, args...)
+	err := db.Unsafe().GetContext(ctx, &result, rawSQL, args...)
 	return result, err
 }
 
@@ -241,9 +241,9 @@ func selectMany[T any](ctx context.Context, db *sqlx.DB, rawSQL string, args ...
 		return unsafeScanRows[T](rows)
 	}
 
-	// Standard sqlx path
+	// Standard sqlx path – use Unsafe so columns not present in T are ignored.
 	var result []T
-	err := db.SelectContext(ctx, &result, rawSQL, args...)
+	err := db.Unsafe().SelectContext(ctx, &result, rawSQL, args...)
 	return result, err
 }
 
