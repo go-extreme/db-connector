@@ -107,14 +107,14 @@ func injectSoftDeleteFilter(sql, filter string) string {
 		// There is an ORDER BY / LIMIT / … clause – inject before it.
 		before := sql[:insertPos]
 		after := sql[insertPos:]
-		if strings.Contains(strings.ToUpper(before), "WHERE") {
+		if strings.Contains(strings.ToUpper(before), " WHERE ") {
 			return before + " AND " + filter + after
 		}
 		return before + " WHERE " + filter + after
 	}
 
 	// No break keyword – append normally.
-	if strings.Contains(upper, "WHERE") {
+	if strings.Contains(upper, " WHERE ") {
 		return sql + " AND " + filter
 	}
 	return sql + " WHERE " + filter

@@ -3,12 +3,16 @@ package dbconnector
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"unsafe"
 
 	"github.com/jmoiron/sqlx"
 )
+
+// sqlScannerType is the reflect.Type of the sql.Scanner interface.
+var sqlScannerType = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
 
 // RowScanner is an optional interface that a domain struct can implement to take
 // full control over how a single database row is scanned into itself.
@@ -60,6 +64,21 @@ func dbTagIndex(t reflect.Type) map[string]int {
 
 // unsafeSetField writes val into the struct field at fieldIndex using unsafe,
 // bypassing Go's export restriction.
+//
+// Coercion priority (first match wins):
+//  1. val == nil                               → skip (leave zero value)
+//  2. []byte dest is string field              → string(val.([]byte))
+//  3. []byte/string dest is map/slice          → JSON-unmarshal
+//  4. dest type directly assignable / convertible
+//  5. *dest implements sql.Scanner             → allocate + Scan
+//  6. dest directly convertible
+//  7. dest is ptr → allocate elem:
+//     a. *elem implements sql.Scanner
+//     b. val directly convertible to elem
+//     c. single-field struct introspection (e.g. *utils.UniqueEntityID)
+//  8. dest is non-ptr struct with sql.Scanner on *dest
+//  9. single-field struct introspection (e.g. utils.UniqueEntityID value field)
+// 10. error
 func unsafeSetField(structPtr unsafe.Pointer, field reflect.StructField, val interface{}) error {
 	if val == nil {
 		return nil
@@ -67,11 +86,40 @@ func unsafeSetField(structPtr unsafe.Pointer, field reflect.StructField, val int
 
 	fieldPtr := unsafe.Pointer(uintptr(structPtr) + field.Offset)
 	fv := reflect.NewAt(field.Type, fieldPtr).Elem()
-
-	// Handle *sql.NullXxx → concrete type conversions automatically.
 	src := reflect.ValueOf(val)
 
-	// database/sql returns []byte for some drivers; handle common cases.
+	// ── 1. []byte coercions ──────────────────────────────────────────────────
+
+	if b, ok := val.([]byte); ok {
+		// []byte → string
+		if field.Type.Kind() == reflect.String {
+			fv.SetString(string(b))
+			return nil
+		}
+		// []byte → map or slice (JSON column)
+		if field.Type.Kind() == reflect.Map || field.Type.Kind() == reflect.Slice {
+			target := reflect.New(field.Type)
+			if err := json.Unmarshal(b, target.Interface()); err != nil {
+				return fmt.Errorf("dbconnector: json.Unmarshal for field %s: %w", field.Name, err)
+			}
+			fv.Set(target.Elem())
+			return nil
+		}
+	}
+
+	// ── 2. string → map / slice (JSON stored as TEXT) ───────────────────────
+	if s, ok := val.(string); ok {
+		if field.Type.Kind() == reflect.Map || field.Type.Kind() == reflect.Slice {
+			target := reflect.New(field.Type)
+			if err := json.Unmarshal([]byte(s), target.Interface()); err != nil {
+				return fmt.Errorf("dbconnector: json.Unmarshal(string) for field %s: %w", field.Name, err)
+			}
+			fv.Set(target.Elem())
+			return nil
+		}
+	}
+
+	// ── 3. direct assign / convert ──────────────────────────────────────────
 	if src.IsValid() && src.Type().AssignableTo(field.Type) {
 		fv.Set(src)
 		return nil
@@ -81,15 +129,61 @@ func unsafeSetField(structPtr unsafe.Pointer, field reflect.StructField, val int
 		return nil
 	}
 
-	// Pointer target: allocate and recurse.
+	// ── 4. pointer field ─────────────────────────────────────────────────────
 	if field.Type.Kind() == reflect.Ptr {
 		elem := field.Type.Elem()
-		newVal := reflect.New(elem)
-		inner := reflect.ValueOf(val)
-		if inner.IsValid() && inner.Type().ConvertibleTo(elem) {
-			newVal.Elem().Set(inner.Convert(elem))
+		newVal := reflect.New(elem) // *elem
+
+		// (a) sql.Scanner on *elem
+		if newVal.Type().Implements(sqlScannerType) {
+			if err := newVal.Interface().(sql.Scanner).Scan(val); err != nil {
+				return fmt.Errorf("dbconnector: Scanner.Scan for ptr field %s: %w", field.Name, err)
+			}
 			fv.Set(newVal)
 			return nil
+		}
+
+		// (b) direct conversion
+		if src.IsValid() && src.Type().ConvertibleTo(elem) {
+			newVal.Elem().Set(src.Convert(elem))
+			fv.Set(newVal)
+			return nil
+		}
+
+		// (c) single-field struct introspection (e.g. *utils.UniqueEntityID{value string})
+		if elem.Kind() == reflect.Struct && src.IsValid() {
+			for i := 0; i < elem.NumField(); i++ {
+				sf := elem.Field(i)
+				if src.Type().ConvertibleTo(sf.Type) {
+					// newVal.Pointer() gives the address of the allocated elem
+					innerPtr := unsafe.Pointer(uintptr(newVal.Pointer()) + sf.Offset)
+					reflect.NewAt(sf.Type, innerPtr).Elem().Set(src.Convert(sf.Type))
+					fv.Set(newVal)
+					return nil
+				}
+			}
+		}
+	}
+
+	// ── 5. non-pointer struct with sql.Scanner (*FieldType implements it) ────
+	ptrToField := reflect.New(field.Type)
+	if ptrToField.Type().Implements(sqlScannerType) {
+		if err := ptrToField.Interface().(sql.Scanner).Scan(val); err != nil {
+			return fmt.Errorf("dbconnector: Scanner.Scan for field %s: %w", field.Name, err)
+		}
+		fv.Set(ptrToField.Elem())
+		return nil
+	}
+
+	// ── 6. single-field struct introspection (value, non-pointer) ────────────
+	if field.Type.Kind() == reflect.Struct && src.IsValid() {
+		for i := 0; i < field.Type.NumField(); i++ {
+			sf := field.Type.Field(i)
+			if src.Type().ConvertibleTo(sf.Type) {
+				innerPtr := unsafe.Pointer(uintptr(structPtr) + field.Offset + sf.Offset)
+				reflect.NewAt(sf.Type, innerPtr).Elem().Set(src.Convert(sf.Type))
+				return nil
+			}
 		}
 	}
 
