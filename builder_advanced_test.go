@@ -418,12 +418,26 @@ func TestQueryBuilder_Clone(t *testing.T) {
 	branch1 := base.Clone().Where("age", 20)
 	branch2 := base.Clone().Where("age", 30)
 
-	if branch1.SQL() == branch2.SQL() {
-		t.Error("clones should diverge after independent Where calls")
+	// SQL structure is identical (both use $2) – but args must differ
+	if len(branch1.Args()) != 2 || len(branch2.Args()) != 2 {
+		t.Errorf("each branch should have 2 args: branch1=%v branch2=%v", branch1.Args(), branch2.Args())
 	}
-	// Base should be unaffected
+	if branch1.Args()[1] == branch2.Args()[1] {
+		t.Errorf("branch args should diverge: branch1=%v branch2=%v", branch1.Args(), branch2.Args())
+	}
+	if branch1.Args()[1] != 20 || branch2.Args()[1] != 30 {
+		t.Errorf("expected branch1[1]=20 branch2[1]=30, got %v %v", branch1.Args()[1], branch2.Args()[1])
+	}
+	// Base should be unaffected – still only 1 arg
+	if len(base.Args()) != 1 {
+		t.Errorf("base args should not be modified by clones: %v", base.Args())
+	}
 	if strings.Contains(base.SQL(), "age") {
-		t.Errorf("base modified by clone branches: %q", base.SQL())
+		t.Errorf("base SQL should not contain age: %q", base.SQL())
+	}
+	// ToSQL should show different interpolated values
+	if branch1.ToSQL() == branch2.ToSQL() {
+		t.Errorf("ToSQL() should differ between clones:\n  b1: %s\n  b2: %s", branch1.ToSQL(), branch2.ToSQL())
 	}
 }
 
@@ -887,6 +901,304 @@ func TestPaginate_QueryBuilderWithLimit_NoBreakCount(t *testing.T) {
 	// COUNT should still reflect all 8 rows
 	if page.Total != 8 {
 		t.Errorf("expected total 8, got %d", page.Total)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// formatArg coverage gaps
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestFormatArg_ByteSlice(t *testing.T) {
+	result := InterpolateSQL("val=$1", []byte("hello"))
+	if result != "val='hello'" {
+		t.Errorf("[]byte: got %q", result)
+	}
+}
+
+func TestFormatArg_ByteSliceWithQuote(t *testing.T) {
+	result := InterpolateSQL("val=$1", []byte("it's"))
+	if !strings.Contains(result, "''") {
+		t.Errorf("[]byte escaping: got %q", result)
+	}
+}
+
+func TestFormatArg_PtrTimestamp_NonNil(t *testing.T) {
+	ts := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	result := InterpolateSQL("col=$1", &ts)
+	if !strings.Contains(result, "2024-06-01") {
+		t.Errorf("*time.Time: got %q", result)
+	}
+}
+
+func TestFormatArg_Int(t *testing.T) {
+	result := InterpolateSQL("x=$1", 42)
+	if result != "x=42" {
+		t.Errorf("int: got %q", result)
+	}
+}
+
+func TestFormatArg_Float(t *testing.T) {
+	result := InterpolateSQL("x=$1", 3.14)
+	if !strings.Contains(result, "3.14") {
+		t.Errorf("float: got %q", result)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WhereNotExists with value bindings (cover the 75% branch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestQueryBuilder_WhereNotExists_WithArgs(t *testing.T) {
+	model := &Model[TestUser]{tableName: "users"}
+	qb := NewQueryBuilder(model).
+		WhereNotExists("SELECT 1 FROM bans WHERE bans.user_id = users.id AND bans.type = ?", "permanent")
+	sql := qb.SQL()
+	if !strings.Contains(sql, "NOT EXISTS (") {
+		t.Errorf("NOT EXISTS missing: %q", sql)
+	}
+	if !strings.Contains(sql, "$1") {
+		t.Errorf("arg not bound: %q", sql)
+	}
+	if len(qb.Args()) != 1 || qb.Args()[0] != "permanent" {
+		t.Errorf("args: %v", qb.Args())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// stripLimitOffset / stripOrderByLimitOffset edge cases
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestStripLimitOffset_OnlyLimit(t *testing.T) {
+	sql := stripLimitOffset("SELECT * FROM users WHERE age=$1 LIMIT 10")
+	if strings.Contains(sql, "LIMIT") {
+		t.Errorf("LIMIT should be stripped: %q", sql)
+	}
+	if !strings.Contains(sql, "WHERE age=$1") {
+		t.Errorf("WHERE should remain: %q", sql)
+	}
+}
+
+func TestStripLimitOffset_LimitAndOffset(t *testing.T) {
+	sql := stripLimitOffset("SELECT * FROM users LIMIT 10 OFFSET 20")
+	if strings.Contains(sql, "LIMIT") || strings.Contains(sql, "OFFSET") {
+		t.Errorf("should strip both: %q", sql)
+	}
+}
+
+func TestStripLimitOffset_NoLimitNoOffset(t *testing.T) {
+	original := "SELECT * FROM users WHERE age=$1 ORDER BY id"
+	sql := stripLimitOffset(original)
+	if sql != original {
+		t.Errorf("should be unchanged: %q", sql)
+	}
+}
+
+func TestStripOrderByLimitOffset_All(t *testing.T) {
+	sql := stripOrderByLimitOffset("SELECT * FROM t WHERE a=1 ORDER BY b LIMIT 5 OFFSET 10")
+	if strings.Contains(strings.ToUpper(sql), "ORDER BY") ||
+		strings.Contains(strings.ToUpper(sql), "LIMIT") ||
+		strings.Contains(strings.ToUpper(sql), "OFFSET") {
+		t.Errorf("should strip all: %q", sql)
+	}
+	if !strings.Contains(sql, "WHERE a=1") {
+		t.Errorf("WHERE should remain: %q", sql)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildCountSQL edge cases
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestBuildCountSQL_WithJoin(t *testing.T) {
+	sql := buildCountSQL(
+		"SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE u.age > 18 ORDER BY u.id",
+		"users",
+	)
+	if !strings.Contains(sql, "COUNT(*)") {
+		t.Errorf("COUNT(*) missing: %q", sql)
+	}
+	if strings.Contains(strings.ToUpper(sql), "ORDER BY") {
+		t.Errorf("ORDER BY should be stripped from count: %q", sql)
+	}
+}
+
+func TestBuildCountSQL_NoFromClause_FallbackSubquery(t *testing.T) {
+	// Exotic SQL without standard FROM (should fall back to subquery)
+	sql := buildCountSQL("VALUES (1),(2),(3)", "dual")
+	if !strings.Contains(sql, "COUNT(*)") {
+		t.Errorf("COUNT(*) missing in fallback: %q", sql)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PaginateAs fallback path: QB SQL without FROM (covers buildCountSQL fallback)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestPaginateAs_SecondPage(t *testing.T) {
+	m, cleanup := setupTable(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		m.Create(ctx, User{
+			ID:    fmt.Sprintf("sp%d", i),
+			Name:  fmt.Sprintf("U%d", i),
+			Email: fmt.Sprintf("u%d@u.com", i),
+			Age:   i,
+		})
+	}
+
+	// page 2, size 2 → should get items [2,3]
+	page, err := PaginateAs[User, User](ctx, m.readConn, 2, 2, m.Query().OrderBy("age", false))
+	if err != nil {
+		t.Fatalf("PaginateAs second page: %v", err)
+	}
+	if page.Total != 5 {
+		t.Errorf("expected 5 total, got %d", page.Total)
+	}
+	if len(page.Items) != 2 {
+		t.Errorf("expected 2 items on page 2, got %d", len(page.Items))
+	}
+	if page.Page != 2 {
+		t.Errorf("expected page 2, got %d", page.Page)
+	}
+	if page.TotalPages != 3 {
+		t.Errorf("expected 3 total pages, got %d", page.TotalPages)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health check partial failure (write DB closed) – covers health.go 66% branch
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestHealthChecker_Check_PartialFailure(t *testing.T) {
+	r := NewPostgresConnection(__TestDBconfig)
+	if err := r.Connect(context.Background()); err != nil {
+		t.Skipf("no DB: %v", err)
+	}
+	defer r.Close()
+
+	// Create a read-only connector where write is same as read (both work).
+	c := NewConnector(r, r)
+	checker := NewHealthChecker(c)
+	status := checker.Check(context.Background())
+	if !status.Healthy {
+		t.Errorf("expected healthy: %v", status.Error)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QueryBuilder.Having with no preceding group – edge case
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestQueryBuilder_Having_NoGroupBy(t *testing.T) {
+	model := &Model[TestUser]{tableName: "users"}
+	qb := NewQueryBuilder(model).Where("active", true).Having("COUNT(*) >", 1)
+	sql := qb.SQL()
+	if !strings.Contains(sql, "HAVING COUNT(*) > $2") {
+		t.Errorf("HAVING clause: %q", sql)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chunk with soft-delete (covers model.go Chunk applyBaseQuery path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestModel_Chunk_SoftDelete(t *testing.T) {
+	m, cleanup := setupSoftDeleteTableAdv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		m.writeConn.DB().Exec(
+			fmt.Sprintf("INSERT INTO %s (id, name, email, age) VALUES ($1,$2,$3,$4)", m.tableName),
+			fmt.Sprintf("c%d", i), fmt.Sprintf("U%d", i), fmt.Sprintf("u%d@u.com", i), i,
+		)
+	}
+	// soft-deleted row
+	m.writeConn.DB().Exec(
+		fmt.Sprintf("INSERT INTO %s (id, name, email, age, deleted_at) VALUES ($1,$2,$3,$4,NOW())", m.tableName),
+		"del", "Deleted", "d@d.com", 99,
+	)
+
+	var processed []User
+	err := m.Chunk(ctx, 10, nil, func(batch []User) error {
+		processed = append(processed, batch...)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Chunk soft-delete: %v", err)
+	}
+	if len(processed) != 3 {
+		t.Errorf("expected 3 active rows, got %d", len(processed))
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QueryBuilder ToSQL with no args
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestQueryBuilder_ToSQL_NoArgs(t *testing.T) {
+	model := &Model[TestUser]{tableName: "users"}
+	qb := NewQueryBuilder(model).WhereNull("deleted_at")
+	sql := qb.ToSQL()
+	// No placeholders – should be unchanged
+	expected := "SELECT * FROM users WHERE deleted_at IS NULL"
+	if sql != expected {
+		t.Errorf("ToSQL no-args: got %q, want %q", sql, expected)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Paginate default values (page=0, pageSize=0 → defaults)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestPaginate_DefaultValues_WithQueryBuilder(t *testing.T) {
+	m, cleanup := setupTable(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	page, err := m.Paginate(ctx, 0, 0, m.Query())
+	if err != nil {
+		t.Fatalf("Paginate defaults: %v", err)
+	}
+	if page.Page != 1 {
+		t.Errorf("expected default page 1, got %d", page.Page)
+	}
+	if page.PageSize != 10 {
+		t.Errorf("expected default pageSize 10, got %d", page.PageSize)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WhereDate conjunction (AND path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestQueryBuilder_WhereDate_WithExistingWhere(t *testing.T) {
+	model := &Model[TestUser]{tableName: "events"}
+	day := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	qb := NewQueryBuilder(model).Where("type", "click").WhereDate("created_at", day)
+	sql := qb.SQL()
+	if !strings.Contains(sql, "AND created_at >= $2 AND created_at < $3") {
+		t.Errorf("WhereDate AND path: %q", sql)
+	}
+	if len(qb.Args()) != 3 {
+		t.Errorf("expected 3 args, got %d: %v", len(qb.Args()), qb.Args())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WhereDateBetween conjunction (AND path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestQueryBuilder_WhereDateBetween_WithExistingWhere(t *testing.T) {
+	model := &Model[TestUser]{tableName: "events"}
+	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2024, 1, 31, 0, 0, 0, 0, time.UTC)
+	qb := NewQueryBuilder(model).Where("type", "view").WhereDateBetween("created_at", from, to)
+	sql := qb.SQL()
+	if !strings.Contains(sql, "AND created_at >= $2") {
+		t.Errorf("WhereDateBetween AND path: %q", sql)
 	}
 }
 

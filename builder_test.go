@@ -194,24 +194,25 @@ func TestQueryBuilder_GroupBy(t *testing.T) {
 func TestQueryBuilder_LimitOffset(t *testing.T) {
 	model := &Model[TestUser]{tableName: "users"}
 	qb := NewQueryBuilder(model)
-	
+
 	qb.Where("age", 30).Limit(10).Offset(20)
-	
+
 	sql := qb.SQL()
-	expected := "SELECT * FROM users WHERE age = $1 LIMIT $2 OFFSET $3"
+	expected := "SELECT * FROM users WHERE age = $1 LIMIT 10 OFFSET 20"
 	if sql != expected {
 		t.Errorf("Expected %q, got %q", expected, sql)
 	}
-	
-	if len(qb.Args()) != 3 {
-		t.Errorf("Expected 3 args, got %d", len(qb.Args()))
+
+	// Only 1 arg for the WHERE clause; LIMIT/OFFSET are literals now
+	if len(qb.Args()) != 1 {
+		t.Errorf("Expected 1 arg, got %d", len(qb.Args()))
 	}
 }
 
 func TestQueryBuilder_ComplexQuery(t *testing.T) {
 	model := &Model[TestUser]{tableName: "users"}
 	qb := NewQueryBuilder(model)
-	
+
 	qb.Where("status", "active").
 		WhereGreaterThan("age", 18).
 		WhereLessThan("age", 65).
@@ -220,15 +221,16 @@ func TestQueryBuilder_ComplexQuery(t *testing.T) {
 		OrderBy("created_at", true).
 		Limit(10).
 		Offset(0)
-	
+
 	sql := qb.SQL()
-	expected := "SELECT * FROM users WHERE status = $1 AND age > $2 AND age < $3 AND role IN ($4,$5) AND email IS NOT NULL ORDER BY created_at DESC LIMIT $6 OFFSET $7"
+	expected := "SELECT * FROM users WHERE status = $1 AND age > $2 AND age < $3 AND role IN ($4,$5) AND email IS NOT NULL ORDER BY created_at DESC LIMIT 10 OFFSET 0"
 	if sql != expected {
 		t.Errorf("Expected %q, got %q", expected, sql)
 	}
-	
-	if len(qb.Args()) != 7 {
-		t.Errorf("Expected 7 args, got %d", len(qb.Args()))
+
+	// Only bound args for WHERE conditions; LIMIT/OFFSET are literals
+	if len(qb.Args()) != 5 {
+		t.Errorf("Expected 5 args, got %d", len(qb.Args()))
 	}
 }
 

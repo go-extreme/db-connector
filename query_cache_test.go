@@ -134,19 +134,35 @@ func TestInMemoryCache(t *testing.T) {
 }
 
 func TestCacheKeyGeneration(t *testing.T) {
-	key1 := generateCacheKey("SELECT * FROM users", "arg1", "arg2")
-	key2 := generateCacheKey("SELECT * FROM users", "arg1", "arg2")
+	// Without table prefix: key is bare sha256 hex (64 chars)
+	key1 := generateCacheKey("", "SELECT * FROM users WHERE id = $1", "arg1", "arg2")
+	key2 := generateCacheKey("", "SELECT * FROM users WHERE id = $1", "arg1", "arg2")
 
 	if key1 != key2 {
 		t.Error("same query and args should generate same key")
 	}
 
-	key3 := generateCacheKey("SELECT * FROM users", "arg1", "arg3")
+	key3 := generateCacheKey("", "SELECT * FROM users WHERE id = $1", "arg1", "arg3")
 	if key1 == key3 {
 		t.Error("different args should generate different keys")
 	}
 
-	if len(key1) != 64 { // SHA-256 produces 64 hex characters
-		t.Errorf("expected SHA-256 hash length 64, got %d", len(key1))
+	if len(key1) != 64 { // SHA-256 produces 64 hex characters when prefix is empty
+		t.Errorf("expected SHA-256 hash length 64 (no prefix), got %d", len(key1))
+	}
+
+	// With table prefix: key is "tableName:sha256hex"
+	keyPrefixed := generateCacheKey("users", "SELECT * FROM users WHERE id = $1", "arg1")
+	if len(keyPrefixed) != 64+1+5 { // "users:" + 64 chars
+		t.Errorf("expected prefixed key length %d, got %d", 64+1+5, len(keyPrefixed))
+	}
+	if keyPrefixed[:6] != "users:" {
+		t.Errorf("expected key to start with 'users:', got %q", keyPrefixed[:6])
+	}
+
+	// Same query, different prefix → different keys
+	keyNoPrefix := generateCacheKey("", "SELECT * FROM users WHERE id = $1", "arg1")
+	if keyPrefixed == keyNoPrefix {
+		t.Error("different prefixes should produce different keys")
 	}
 }

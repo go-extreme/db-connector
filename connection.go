@@ -40,6 +40,12 @@ func (c *PostgresConnection) Connect(ctx context.Context) error {
 
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		c.config.Host, c.config.Port, c.config.User, c.config.Password, c.config.Database, c.config.SSLMode)
+	if c.config.ApplicationName != "" {
+		dsn += fmt.Sprintf(" application_name=%s", c.config.ApplicationName)
+	}
+	if c.config.ConnectTimeout > 0 {
+		dsn += fmt.Sprintf(" connect_timeout=%d", int(c.config.ConnectTimeout.Seconds()))
+	}
 
 	db, err := sqlx.ConnectContext(ctx, "postgres", dsn)
 	if err != nil {
